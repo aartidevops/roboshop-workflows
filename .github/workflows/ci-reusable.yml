@@ -1,0 +1,397 @@
+# ═══════════════════════════════════════════════════════════════════
+# REUSABLE CI PIPELINE — DevSecOps
+#
+# Called by every microservice repo. Contains ALL logic so there is
+# zero duplication. To add a new tool to every service at once,
+# edit only this file.
+#
+# PIPELINE STAGES:
+#   1. gitleaks   — secrets accidentally committed? hard block.
+#   2. semgrep    — SAST: vulnerable code patterns? warn.
+#   3. trivy-fs   — SCA: vulnerable npm/maven deps? critical=block.
+#   4. build      — docker build (only runs if stages 1-3 pass)
+#   5. trivy-img  — container scan: CVEs in base image? critical=block.
+#   6. push       — push to ACR (only if all scans pass)
+#   7. deploy     — update gitops values file → ArgoCD picks it up
+#
+# INPUTS (passed from each service's ci.yml):
+#   service_name  — catalogue | cart | frontend | user | shipping | payment | dispatch
+#   acr_name      — Azure Container Registry name (e.g. roboshopdevacr)
+#   language      — node | java | python  (controls Semgrep ruleset)
+#   deploy_uat    — true/false: whether a UAT environment exists
+#   deploy_prod   — true/false: whether a prod environment exists
+# ═══════════════════════════════════════════════════════════════════
+
+name: CI Reusable
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        required: true
+        type: string
+      acr_name:
+        required: true
+        type: string
+        default: roboshopdevacr
+      language:
+        required: false
+        type: string
+        default: node
+      deploy_uat:
+        required: false
+        type: boolean
+        default: false
+      deploy_prod:
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      AZURE_CLIENT_ID:
+        required: true
+      AZURE_TENANT_ID:
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+      GITOPS_TOKEN:
+        required: true
+
+jobs:
+  # ─────────────────────────────────────────────────────────────
+  # JOB 1: SECRETS SCAN (GitLeaks)
+  #
+  # What: scans entire git history for accidentally committed secrets
+  #       (passwords, API keys, tokens, connection strings)
+  # Why first: if a secret leaked, everything stops immediately.
+  #            No point building a Docker image containing a password.
+  # Blocks: yes — any detected secret = pipeline fails hard
+  # ─────────────────────────────────────────────────────────────
+  gitleaks:
+    name: Secrets Scan (GitLeaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history so gitleaks can scan all commits, not just latest
+
+      - name: Run GitLeaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GITLEAKS_LICENSE not needed for public repos
+          # For private repos on free plan: set GITLEAKS_ENABLE_COMMENTS=false
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 2: SAST — Static Application Security Testing (Semgrep)
+  #
+  # What: reads source code without running it and finds:
+  #       - SQL injection patterns
+  #       - Hardcoded credentials
+  #       - Insecure crypto (MD5, SHA1)
+  #       - Path traversal vulnerabilities
+  #       - XSS-prone code patterns
+  # Why: catches YOUR code bugs — not library bugs (that's Trivy's job)
+  # Blocks: NO — warns only. Semgrep has false positives; blocking
+  #         on first run overwhelms teams. Review reports first,
+  #         then enable --error flag once noise is managed.
+  # ─────────────────────────────────────────────────────────────
+  semgrep:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Semgrep
+        run: |
+          # Select ruleset based on language
+          # p/nodejs     → Express, prototype pollution, JWT issues
+          # p/java       → Spring, XXE, deserialization
+          # p/python     → Flask/Django, pickle, subprocess injection
+          # p/dockerfile → insecure base images, root user, ADD vs COPY
+          # p/secrets    → generic secret patterns across all languages
+          RULESETS="p/secrets p/dockerfile"
+          case "${{ inputs.language }}" in
+            node)  RULESETS="$RULESETS p/nodejs p/javascript" ;;
+            java)  RULESETS="$RULESETS p/java" ;;
+            python) RULESETS="$RULESETS p/python" ;;
+          esac
+
+          semgrep scan \
+            --config $RULESETS \
+            --json \
+            --output semgrep-results.json \
+            . || true   # --error would block; we warn-only for now
+
+          # Pretty print summary
+          semgrep scan --config $RULESETS . 2>&1 | tail -20 || true
+
+      - name: Upload Semgrep results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: semgrep-${{ inputs.service_name }}-${{ github.sha }}
+          path: semgrep-results.json
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 3: SCA — Software Composition Analysis (Trivy filesystem)
+  #
+  # What: scans package.json/pom.xml/requirements.txt for libraries
+  #       with known CVEs (Common Vulnerabilities and Exposures).
+  #       Also scans for secrets in files (belt-and-suspenders).
+  # Why: your app depends on express@4.18.2, mongoose@8.0.0 — if
+  #      those have a vulnerability, your app inherits it.
+  # Blocks: YES on CRITICAL severity only.
+  #         HIGH = warning in report but build continues.
+  #         CRITICAL = someone can take over your server. Hard stop.
+  # ─────────────────────────────────────────────────────────────
+  trivy-fs:
+    name: SCA (Trivy filesystem)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: table
+          exit-code: '1'          # fail the job
+          severity: CRITICAL      # only fail on CRITICAL; HIGH shown in report
+          scanners: vuln,secret
+          output: trivy-fs-results.txt
+
+      - name: Show full report (HIGH + CRITICAL)
+        if: always()
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: table
+          exit-code: '0'          # informational only
+          severity: HIGH,CRITICAL
+          scanners: vuln,secret
+
+      - name: Upload Trivy FS results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-fs-${{ inputs.service_name }}-${{ github.sha }}
+          path: trivy-fs-results.txt
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 4: BUILD + CONTAINER SCAN + PUSH
+  #
+  # Runs only after jobs 1-3 all pass (gitleaks hard-blocks;
+  # trivy-fs blocks on CRITICAL; semgrep warns only)
+  #
+  # Steps:
+  #   a. Login to Azure ACR via OIDC (no stored secrets!)
+  #   b. Docker build
+  #   c. Trivy image scan — scans OS packages in the final image
+  #      (e.g. node:18-alpine has musl, libssl — these have CVEs)
+  #   d. Push image to ACR (only if image scan passes)
+  # ─────────────────────────────────────────────────────────────
+  build-scan-push:
+    name: Build → Scan → Push
+    runs-on: ubuntu-latest
+    needs: [gitleaks, trivy-fs]   # semgrep is warn-only so not in needs
+    outputs:
+      image_tag: ${{ steps.tag.outputs.tag }}
+      image_full: ${{ steps.tag.outputs.full }}
+
+    permissions:
+      id-token: write   # OIDC: GitHub mints JWT → Azure validates → no stored password
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: tag
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          BRANCH=$(echo ${GITHUB_REF_NAME} | sed 's/\//-/g')
+          TAG="${BRANCH}-${SHORT_SHA}"
+          FULL="${{ inputs.acr_name }}.azurecr.io/${{ inputs.service_name }}:${TAG}"
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "full=${FULL}" >> $GITHUB_OUTPUT
+          echo "Building: ${FULL}"
+
+      - name: Azure login (OIDC — no stored secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Login to ACR
+        run: az acr login --name ${{ inputs.acr_name }}
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --tag ${{ steps.tag.outputs.full }} \
+            --tag ${{ inputs.acr_name }}.azurecr.io/${{ inputs.service_name }}:latest \
+            --label "git.sha=${{ github.sha }}" \
+            --label "git.branch=${{ github.ref_name }}" \
+            --label "built.by=github-actions" \
+            .
+
+      # ── Container scan ──────────────────────────────────────
+      # Scans the BUILT image (not source code) for:
+      # - OS package CVEs (alpine, debian packages)
+      # - Language runtime vulnerabilities
+      # - Exposed secrets baked into layers
+      # This catches things like: node:18-alpine ships with
+      # libssl that has a critical CVE → your image is vulnerable
+      # even though your own code is fine
+      - name: Scan image (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: image
+          image-ref: ${{ steps.tag.outputs.full }}
+          format: table
+          exit-code: '1'
+          severity: CRITICAL
+          scanners: vuln,secret
+
+      - name: Show full image report (HIGH+CRITICAL)
+        if: always()
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: image
+          image-ref: ${{ steps.tag.outputs.full }}
+          format: table
+          exit-code: '0'
+          severity: HIGH,CRITICAL
+
+      - name: Push image to ACR
+        run: |
+          docker push ${{ steps.tag.outputs.full }}
+          docker push ${{ inputs.acr_name }}.azurecr.io/${{ inputs.service_name }}:latest
+          echo "✅ Pushed: ${{ steps.tag.outputs.full }}"
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 5: DEPLOY TO DEV
+  #
+  # Updates the image tag in roboshop-gitops/environments/dev/
+  # ArgoCD detects the change and deploys within ~30 seconds.
+  # This is the GitOps pattern: git is the source of truth,
+  # not kubectl apply.
+  #
+  # Retry loop handles race condition: if catalogue and cart
+  # pipelines run at the same time and both try to push to
+  # gitops, one will fail with "non-fast-forward". The retry
+  # loop pulls and rebases, then pushes again.
+  # ─────────────────────────────────────────────────────────────
+  deploy-dev:
+    name: Deploy → dev
+    runs-on: ubuntu-latest
+    needs: build-scan-push
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout gitops
+        uses: actions/checkout@v4
+        with:
+          repository: aartidevops/roboshop-gitops
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: gitops
+
+      - name: Update dev tag
+        run: |
+          cd gitops
+          git config user.email "ci@roboshop.com"
+          git config user.name "CI Bot"
+          git pull origin main
+          sed -i "s|tag:.*|tag: \"${{ needs.build-scan-push.outputs.image_tag }}\"|" \
+            environments/dev/${{ inputs.service_name }}-values.yaml
+          git add environments/dev/${{ inputs.service_name }}-values.yaml
+          git diff --staged --quiet && echo "No change" && exit 0
+          git commit -m "ci(${{ inputs.service_name }}): dev → ${{ needs.build-scan-push.outputs.image_tag }}"
+          for i in 1 2 3; do
+            git push origin main && break
+            echo "Retry $i/3..."
+            git pull --rebase origin main
+            sleep $((i * 5))
+          done
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 6: DEPLOY TO UAT (optional, requires manual approval)
+  #
+  # Uses GitHub Environments feature — "uat" environment must be
+  # configured in repo Settings → Environments with a required
+  # reviewer. Pipeline pauses here until someone clicks Approve.
+  # This gives you: automated build + security scan, human gate
+  # before UAT, another human gate before prod.
+  # ─────────────────────────────────────────────────────────────
+  deploy-uat:
+    name: Deploy → uat
+    runs-on: ubuntu-latest
+    needs: [build-scan-push, deploy-dev]
+    if: github.ref == 'refs/heads/main' && inputs.deploy_uat == true
+    environment:
+      name: uat   # configured in GitHub repo Settings → Environments
+
+    steps:
+      - name: Checkout gitops
+        uses: actions/checkout@v4
+        with:
+          repository: aartidevops/roboshop-gitops
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: gitops
+
+      - name: Update UAT tag
+        run: |
+          cd gitops
+          git config user.email "ci@roboshop.com"
+          git config user.name "CI Bot"
+          git pull origin main
+          sed -i "s|tag:.*|tag: \"${{ needs.build-scan-push.outputs.image_tag }}\"|" \
+            environments/uat/${{ inputs.service_name }}-values.yaml
+          git add environments/uat/${{ inputs.service_name }}-values.yaml
+          git diff --staged --quiet && echo "No change" && exit 0
+          git commit -m "ci(${{ inputs.service_name }}): uat → ${{ needs.build-scan-push.outputs.image_tag }}"
+          for i in 1 2 3; do
+            git push origin main && break
+            git pull --rebase origin main
+            sleep $((i * 5))
+          done
+
+  deploy-prod:
+    name: Deploy → prod
+    runs-on: ubuntu-latest
+    needs: [build-scan-push, deploy-uat]
+    if: github.ref == 'refs/heads/main' && inputs.deploy_prod == true
+    environment:
+      name: prod
+
+    steps:
+      - name: Checkout gitops
+        uses: actions/checkout@v4
+        with:
+          repository: aartidevops/roboshop-gitops
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: gitops
+
+      - name: Update prod tag
+        run: |
+          cd gitops
+          git config user.email "ci@roboshop.com"
+          git config user.name "CI Bot"
+          git pull origin main
+          sed -i "s|tag:.*|tag: \"${{ needs.build-scan-push.outputs.image_tag }}\"|" \
+            environments/prod/${{ inputs.service_name }}-values.yaml
+          git add environments/prod/${{ inputs.service_name }}-values.yaml
+          git diff --staged --quiet && echo "No change" && exit 0
+          git commit -m "ci(${{ inputs.service_name }}): prod → ${{ needs.build-scan-push.outputs.image_tag }}"
+          for i in 1 2 3; do
+            git push origin main && break
+            git pull --rebase origin main
+            sleep $((i * 5))
+          done
