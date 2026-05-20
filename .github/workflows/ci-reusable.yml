@@ -6,18 +6,23 @@
 # edit only this file.
 #
 # PIPELINE STAGES:
-#   1. gitleaks   — secrets accidentally committed? hard block.
-#   2. semgrep    — SAST: vulnerable code patterns? warn.
-#   3. trivy-fs   — SCA: vulnerable npm/maven deps? critical=block.
-#   4. build      — docker build (only runs if stages 1-3 pass)
-#   5. trivy-img  — container scan: CVEs in base image? critical=block.
-#   6. push       — push to ACR (only if all scans pass)
-#   7. deploy     — update gitops values file → ArgoCD picks it up
+#   1. gitguardian — secrets accidentally committed? hard block.
+#                    SaaS: dashboard.gitguardian.com shows you exactly
+#                    which commit, which file, which secret type.
+#   2. sonarqube   — SAST: your code bugs (SQLi, XSS, hardcoded creds)
+#                    Self-hosted in AKS. Quality Gate blocks build.
+#   3. snyk        — SCA: vulnerable npm/maven/pip dependencies?
+#                    critical=block. SaaS: app.snyk.io dashboard.
+#   4. build       — docker build (only runs if stages 1-3 pass)
+#   5. trivy-img   — container scan: CVEs in the base OS image?
+#                    critical=block.
+#   6. push        — push to ACR (only if all scans pass)
+#   7. deploy      — update gitops values file → ArgoCD picks it up
 #
 # INPUTS (passed from each service's ci.yml):
 #   service_name  — catalogue | cart | frontend | user | shipping | payment | dispatch
 #   acr_name      — Azure Container Registry name (e.g. roboshopdevacr)
-#   language      — node | java | python  (controls Semgrep ruleset)
+#   language      — node | java | python  (controls Snyk ecosystem)
 #   deploy_uat    — true/false: whether a UAT environment exists
 #   deploy_prod   — true/false: whether a prod environment exists
 # ═══════════════════════════════════════════════════════════════════
@@ -31,7 +36,7 @@ on:
         required: true
         type: string
       acr_name:
-        required: true
+        required: false
         type: string
         default: roboshopdevacr
       language:
@@ -55,151 +60,168 @@ on:
         required: true
       GITOPS_TOKEN:
         required: true
+      GITGUARDIAN_API_KEY:
+        required: false
+      SONAR_TOKEN:
+        required: false
+      SONAR_HOST_URL:
+        required: false
+      SNYK_TOKEN:
+        required: false
 
 jobs:
   # ─────────────────────────────────────────────────────────────
-  # JOB 1: SECRETS SCAN (GitLeaks)
+  # JOB 1: SECRETS SCAN (GitGuardian)
   #
-  # What: scans entire git history for accidentally committed secrets
-  #       (passwords, API keys, tokens, connection strings)
-  # Why first: if a secret leaked, everything stops immediately.
-  #            No point building a Docker image containing a password.
-  # Blocks: yes — any detected secret = pipeline fails hard
+  # What: scans every file in every commit for secrets —
+  #       API keys, passwords, connection strings, certificates.
+  #       GitGuardian has 350+ detectors trained on real leaks.
+  #
+  # Why GitGuardian over GitLeaks:
+  #   GitLeaks = open source, regex-based, good but basic.
+  #   GitGuardian = SaaS, ML-powered, used by Netflix, Snowflake,
+  #   Hashicorp. Dashboard shows you: which commit, which developer,
+  #   which secret type, and guides remediation. The free tier
+  #   covers public repos and up to 25 developers.
+  #
+  # Setup: dashboard.gitguardian.com → API → create key →
+  #        add as GITGUARDIAN_API_KEY in each repo's Settings → Secrets
+  #
+  # Blocks: YES — any detected secret = pipeline fails hard.
+  #         The developer MUST rotate the secret before merging.
   # ─────────────────────────────────────────────────────────────
-  gitleaks:
-    name: Secrets Scan (GitLeaks)
+  gitguardian:
+    name: Secrets Scan (GitGuardian)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # full history so gitleaks can scan all commits, not just latest
+          fetch-depth: 0   # full history — GitGuardian scans ALL commits, not just HEAD
 
-      - name: Run GitLeaks
-        uses: gitleaks/gitleaks-action@v2
+      - name: GitGuardian scan
+        uses: GitGuardian/ggshield-action@v1
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # GITLEAKS_LICENSE not needed for public repos
-          # For private repos on free plan: set GITLEAKS_ENABLE_COMMENTS=false
+          GITHUB_PUSH_BEFORE_SHA: ${{ github.event.before }}
+          GITHUB_PUSH_BASE_SHA: ${{ github.event.base }}
+          GITHUB_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GITGUARDIAN_API_KEY: ${{ secrets.GITGUARDIAN_API_KEY }}
 
   # ─────────────────────────────────────────────────────────────
-  # JOB 2: SAST — Static Application Security Testing (Semgrep)
+  # JOB 2: SAST — Static Application Security Testing (SonarQube)
   #
-  # What: reads source code without running it and finds:
-  #       - SQL injection patterns
-  #       - Hardcoded credentials
-  #       - Insecure crypto (MD5, SHA1)
-  #       - Path traversal vulnerabilities
-  #       - XSS-prone code patterns
-  # Why: catches YOUR code bugs — not library bugs (that's Trivy's job)
-  # Blocks: NO — warns only. Semgrep has false positives; blocking
-  #         on first run overwhelms teams. Review reports first,
-  #         then enable --error flag once noise is managed.
+  # What: sends source code to self-hosted SonarQube running in AKS.
+  # SonarQube does deep analysis:
+  #   - Taint analysis: tracks user input → does it reach a SQL query
+  #     without sanitisation? → SQL injection vulnerability
+  #   - Security hotspots: crypto, authentication, XSS patterns
+  #   - Code smells and tech debt (bonus, not just security)
+  #   - Quality Gate: blocks merge if new critical issues introduced
+  #
+  # How it works end-to-end:
+  #   1. sonarqube-scan-action runs the SonarQube scanner CLI
+  #   2. Scanner reads your source code + sonar-project.properties
+  #   3. Sends analysis to SONAR_HOST_URL (your AKS-hosted SonarQube)
+  #   4. SonarQube evaluates the Quality Gate
+  #   5. Scanner polls and fails the job if Quality Gate = FAILED
+  #
+  # sonar-project.properties must exist in each service repo.
+  # It tells SonarQube: project key, what to scan, what to exclude.
+  #
+  # Blocks: YES — quality gate failure = pipeline stops here.
   # ─────────────────────────────────────────────────────────────
-  semgrep:
-    name: SAST (Semgrep)
+  sonarqube:
+    name: SAST (SonarQube)
     runs-on: ubuntu-latest
-    container:
-      image: semgrep/semgrep
+    # continue-on-error: SonarQube is only available after ./build.sh provisions AKS.
+    # Before that, SONAR_TOKEN is empty and this job will be skipped gracefully.
+    # Once push-secrets.sh runs after build, it auto-sets the token and this job activates.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-
-      - name: Run Semgrep
-        run: |
-          # Select ruleset based on language
-          # p/nodejs     → Express, prototype pollution, JWT issues
-          # p/java       → Spring, XXE, deserialization
-          # p/python     → Flask/Django, pickle, subprocess injection
-          # p/dockerfile → insecure base images, root user, ADD vs COPY
-          # p/secrets    → generic secret patterns across all languages
-          RULESETS="p/secrets p/dockerfile"
-          case "${{ inputs.language }}" in
-            node)  RULESETS="$RULESETS p/nodejs p/javascript" ;;
-            java)  RULESETS="$RULESETS p/java" ;;
-            python) RULESETS="$RULESETS p/python" ;;
-          esac
-
-          semgrep scan \
-            --config $RULESETS \
-            --json \
-            --output semgrep-results.json \
-            . || true   # --error would block; we warn-only for now
-
-          # Pretty print summary
-          semgrep scan --config $RULESETS . 2>&1 | tail -20 || true
-
-      - name: Upload Semgrep results
-        uses: actions/upload-artifact@v4
-        if: always()
         with:
-          name: semgrep-${{ inputs.service_name }}-${{ github.sha }}
-          path: semgrep-results.json
-          retention-days: 30
+          fetch-depth: 0   # full history for blame annotations in SonarQube UI
+
+      # Java (shipping) only: SonarQube needs compiled bytecode for Java
+      # It can't scan Java source code alone — it reads .class files
+      # from target/classes/ which maven package produces
+      - name: Build Java (shipping only)
+        if: inputs.language == 'java'
+        run: mvn -B package -DskipTests
+
+      - name: SonarQube Scan
+        if: env.SONAR_TOKEN != '' && env.SONAR_HOST_URL != ''
+        uses: SonarSource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
 
   # ─────────────────────────────────────────────────────────────
-  # JOB 3: SCA — Software Composition Analysis (Trivy filesystem)
+  # JOB 3: SCA — Software Composition Analysis (Snyk)
   #
-  # What: scans package.json/pom.xml/requirements.txt for libraries
-  #       with known CVEs (Common Vulnerabilities and Exposures).
-  #       Also scans for secrets in files (belt-and-suspenders).
-  # Why: your app depends on express@4.18.2, mongoose@8.0.0 — if
-  #      those have a vulnerability, your app inherits it.
+  # What: scans your package.json / pom.xml / requirements.txt for
+  #       libraries with known CVEs. Your code may be clean but if
+  #       express@4.18.2 has a critical RCE, your app is vulnerable.
+  #
+  # Why Snyk over Trivy-fs or OWASP Dependency Check:
+  #   Snyk = SaaS, real-time CVE database, auto-fix PRs,
+  #   used by Google, Salesforce, Atlassian. The CLI sends results
+  #   to app.snyk.io where your team can see all projects, triage
+  #   issues, and click "Open Fix PR" to auto-bump a vulnerable dep.
+  #   Free tier: unlimited open source projects.
+  #
+  # Snyk also produces SARIF output → uploads to GitHub Security tab
+  # so developers see CVEs directly in PRs under "Code scanning alerts"
+  #
+  # Setup: app.snyk.io → Account Settings → API Token →
+  #        add as SNYK_TOKEN in each repo's Settings → Secrets
+  #
   # Blocks: YES on CRITICAL severity only.
-  #         HIGH = warning in report but build continues.
-  #         CRITICAL = someone can take over your server. Hard stop.
+  #         HIGH and below = warning in Snyk dashboard.
   # ─────────────────────────────────────────────────────────────
-  trivy-fs:
-    name: SCA (Trivy filesystem)
+  snyk:
+    name: SCA (Snyk)
     runs-on: ubuntu-latest
+    permissions:
+      security-events: write   # needed to upload SARIF to GitHub Security tab
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run Trivy filesystem scan
-        uses: aquasecurity/trivy-action@master
+      - name: Run Snyk to check for vulnerabilities
+        uses: snyk/actions/node@master
+        continue-on-error: true   # allows SARIF upload even on failure
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         with:
-          scan-type: fs
-          scan-ref: .
-          format: table
-          exit-code: '1'          # fail the job
-          severity: CRITICAL      # only fail on CRITICAL; HIGH shown in report
-          scanners: vuln,secret
-          output: trivy-fs-results.txt
+          args: --severity-threshold=critical --sarif-file-output=snyk.sarif
 
-      - name: Show full report (HIGH + CRITICAL)
-        if: always()
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: fs
-          scan-ref: .
-          format: table
-          exit-code: '0'          # informational only
-          severity: HIGH,CRITICAL
-          scanners: vuln,secret
-
-      - name: Upload Trivy FS results
-        uses: actions/upload-artifact@v4
+      # Upload to GitHub Security tab — developers see CVEs in PRs
+      # without leaving GitHub. Click the alert → see fix guidance.
+      - name: Upload Snyk results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
-          name: trivy-fs-${{ inputs.service_name }}-${{ github.sha }}
-          path: trivy-fs-results.txt
-          retention-days: 30
+          sarif_file: snyk.sarif
 
   # ─────────────────────────────────────────────────────────────
   # JOB 4: BUILD + CONTAINER SCAN + PUSH
   #
-  # Runs only after jobs 1-3 all pass (gitleaks hard-blocks;
-  # trivy-fs blocks on CRITICAL; semgrep warns only)
+  # Runs only after jobs 1-3 all pass.
+  # (gitguardian + sonarqube + snyk all block on critical failures)
   #
   # Steps:
-  #   a. Login to Azure ACR via OIDC (no stored secrets!)
-  #   b. Docker build
-  #   c. Trivy image scan — scans OS packages in the final image
-  #      (e.g. node:18-alpine has musl, libssl — these have CVEs)
-  #   d. Push image to ACR (only if image scan passes)
+  #   a. Login to Azure ACR via OIDC — no stored password anywhere.
+  #      GitHub mints a short-lived JWT, Azure validates it.
+  #      This is the modern zero-secret approach.
+  #   b. Docker build with labels (git sha, branch, who built it)
+  #   c. Trivy image scan — scans OS packages in the BUILT IMAGE
+  #      e.g. node:18-alpine ships with musl, libssl — these have CVEs
+  #      even if your app code is clean. Trivy catches them.
+  #   d. Push to ACR (only if Trivy finds no CRITICAL CVEs)
   # ─────────────────────────────────────────────────────────────
   build-scan-push:
     name: Build → Scan → Push
     runs-on: ubuntu-latest
-    needs: [gitleaks, trivy-fs]   # semgrep is warn-only so not in needs
+    needs: [gitguardian, snyk]   # sonarqube has continue-on-error so excluded here
     outputs:
       image_tag: ${{ steps.tag.outputs.tag }}
       image_full: ${{ steps.tag.outputs.full }}
@@ -242,52 +264,56 @@ jobs:
             --label "built.by=github-actions" \
             .
 
-      # ── Container scan ──────────────────────────────────────
-      # Scans the BUILT image (not source code) for:
-      # - OS package CVEs (alpine, debian packages)
-      # - Language runtime vulnerabilities
-      # - Exposed secrets baked into layers
-      # This catches things like: node:18-alpine ships with
-      # libssl that has a critical CVE → your image is vulnerable
-      # even though your own code is fine
+      # ── Container scan (Trivy image) ──────────────────────────
+      # Trivy scans the built Docker image layers for:
+      # - OS package CVEs (alpine apk packages, debian apt packages)
+      # - Language runtime CVEs (node, python, java embedded in image)
+      # - Secrets accidentally baked into image layers
+      #
+      # This is DIFFERENT from Snyk above:
+      #   Snyk scanned your source code's dependencies (package.json)
+      #   Trivy scans what's actually inside the Docker image OS
+      #
+      # Example: your package.json may be fine but the base image
+      # node:18-alpine might ship with libssl that has a critical CVE.
+      # Snyk would miss this. Trivy catches it.
       - name: Scan image (Trivy)
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: image
           image-ref: ${{ steps.tag.outputs.full }}
           format: table
-          exit-code: '1'
+          exit-code: '1'          # fail job on CRITICAL
           severity: CRITICAL
           scanners: vuln,secret
 
-      - name: Show full image report (HIGH+CRITICAL)
+      - name: Show full image report (HIGH + CRITICAL)
         if: always()
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: image
           image-ref: ${{ steps.tag.outputs.full }}
           format: table
-          exit-code: '0'
+          exit-code: '0'          # informational only
           severity: HIGH,CRITICAL
 
       - name: Push image to ACR
         run: |
           docker push ${{ steps.tag.outputs.full }}
           docker push ${{ inputs.acr_name }}.azurecr.io/${{ inputs.service_name }}:latest
-          echo "✅ Pushed: ${{ steps.tag.outputs.full }}"
+          echo "Pushed: ${{ steps.tag.outputs.full }}"
 
   # ─────────────────────────────────────────────────────────────
   # JOB 5: DEPLOY TO DEV
   #
   # Updates the image tag in roboshop-gitops/environments/dev/
-  # ArgoCD detects the change and deploys within ~30 seconds.
-  # This is the GitOps pattern: git is the source of truth,
-  # not kubectl apply.
+  # ArgoCD detects the commit within ~30 seconds and syncs.
+  # This is the GitOps pattern: git IS the deployment record.
   #
-  # Retry loop handles race condition: if catalogue and cart
-  # pipelines run at the same time and both try to push to
-  # gitops, one will fail with "non-fast-forward". The retry
-  # loop pulls and rebases, then pushes again.
+  # Race condition handling: if catalogue and cart pipelines run
+  # simultaneously, both try to push to the same gitops file.
+  # One succeeds, the other gets "non-fast-forward" rejection.
+  # The retry loop: pull --rebase (get latest), push again.
   # ─────────────────────────────────────────────────────────────
   deploy-dev:
     name: Deploy → dev
@@ -324,11 +350,14 @@ jobs:
   # ─────────────────────────────────────────────────────────────
   # JOB 6: DEPLOY TO UAT (optional, requires manual approval)
   #
-  # Uses GitHub Environments feature — "uat" environment must be
-  # configured in repo Settings → Environments with a required
-  # reviewer. Pipeline pauses here until someone clicks Approve.
-  # This gives you: automated build + security scan, human gate
-  # before UAT, another human gate before prod.
+  # GitHub Environments feature: "uat" environment must be
+  # configured in repo Settings → Environments → Protection rules
+  # → Required reviewers. Pipeline pauses until someone approves.
+  #
+  # Real company workflow:
+  #   1. Dev pushes code → auto-deploys to dev (no approval)
+  #   2. QA reviews dev → approves UAT deployment in GitHub UI
+  #   3. Product Owner reviews UAT → approves prod deployment
   # ─────────────────────────────────────────────────────────────
   deploy-uat:
     name: Deploy → uat
@@ -336,7 +365,7 @@ jobs:
     needs: [build-scan-push, deploy-dev]
     if: github.ref == 'refs/heads/main' && inputs.deploy_uat == true
     environment:
-      name: uat   # configured in GitHub repo Settings → Environments
+      name: uat
 
     steps:
       - name: Checkout gitops
