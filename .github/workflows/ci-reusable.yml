@@ -186,19 +186,42 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run Snyk to check for vulnerabilities
+      # Use language-appropriate Snyk action:
+      #   node   → scans package.json / package-lock.json
+      #   python → scans requirements.txt / Pipfile
+      #   java   → scans pom.xml (maven)
+      - name: Snyk scan (node)
+        if: inputs.language == 'node'
         uses: snyk/actions/node@master
-        continue-on-error: true   # allows SARIF upload even on failure
+        continue-on-error: true
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         with:
           args: --severity-threshold=critical --sarif-file-output=snyk.sarif
 
-      # Upload to GitHub Security tab — developers see CVEs in PRs
-      # without leaving GitHub. Click the alert → see fix guidance.
+      - name: Snyk scan (python)
+        if: inputs.language == 'python'
+        uses: snyk/actions/python@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=critical --sarif-file-output=snyk.sarif
+
+      - name: Snyk scan (java/maven)
+        if: inputs.language == 'java'
+        uses: snyk/actions/maven@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=critical --sarif-file-output=snyk.sarif
+
+      # Upload to GitHub Security tab only if SARIF file was produced
+      # (Snyk may not generate it if there's no manifest file or token issue)
       - name: Upload Snyk results to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        if: always() && hashFiles('snyk.sarif') != ''
         with:
           sarif_file: snyk.sarif
 
