@@ -190,6 +190,14 @@ jobs:
       #   node   → scans package.json / package-lock.json
       #   python → scans requirements.txt / Pipfile
       #   java   → scans pom.xml (maven)
+      - name: Install dependencies (required for Snyk to scan)
+        run: |
+          case "${{ inputs.language }}" in
+            node)   npm install --ignore-scripts ;;
+            python) pip install -r requirements.txt --ignore-installed 2>/dev/null || true ;;
+            java)   mvn dependency:resolve -q 2>/dev/null || true ;;
+          esac
+
       - name: Snyk scan (node)
         if: inputs.language == 'node'
         uses: snyk/actions/node@master
