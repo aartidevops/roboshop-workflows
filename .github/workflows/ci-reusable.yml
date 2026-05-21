@@ -186,11 +186,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Use language-appropriate Snyk action:
-      #   node   → scans package.json / package-lock.json
-      #   python → scans requirements.txt / Pipfile
-      #   java   → scans pom.xml (maven)
-      - name: Install dependencies (required for Snyk to scan)
+      # Java only: runner has Maven pre-installed but we still need to set up
+      # the JDK so that mvn can resolve dependencies for Snyk to scan.
+      # (Not needed for node/python — their runtimes are always on the runner)
+      - name: Setup Java (shipping only)
+        if: inputs.language == 'java'
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      # Install dependencies so Snyk can build the dependency graph.
+      # Why: Snyk doesn't just read manifest files — it resolves the full
+      # transitive tree. For node that needs node_modules, for java it needs
+      # to run mvn, for python it needs installed packages.
+      - name: Install dependencies
         run: |
           case "${{ inputs.language }}" in
             node)   npm install --ignore-scripts ;;
@@ -198,32 +209,22 @@ jobs:
             java)   mvn dependency:resolve -q 2>/dev/null || true ;;
           esac
 
-      - name: Snyk scan (node)
-        if: inputs.language == 'node'
-        uses: snyk/actions/node@master
-        continue-on-error: true
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        with:
-          args: --severity-threshold=critical --sarif-file-output=snyk.sarif
+      # Why snyk/actions/setup instead of snyk/actions/node|python|maven:
+      # The language-specific actions (node/python/maven) run Snyk inside a
+      # Docker container (snyk/snyk:node). That container has Node but NOT
+      # Maven or Python. So the maven action fails with "mvn: not found".
+      # snyk/actions/setup installs the Snyk CLI directly on the runner
+      # (which already has Node, Maven, Python all available). Then we call
+      # `snyk test` as a plain shell command — it auto-detects the manifest
+      # file (package.json / pom.xml / requirements.txt) and scans correctly.
+      - name: Install Snyk CLI
+        uses: snyk/actions/setup@master
 
-      - name: Snyk scan (python)
-        if: inputs.language == 'python'
-        uses: snyk/actions/python@master
+      - name: Snyk scan
         continue-on-error: true
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        with:
-          args: --severity-threshold=critical --sarif-file-output=snyk.sarif
-
-      - name: Snyk scan (java/maven)
-        if: inputs.language == 'java'
-        uses: snyk/actions/maven@master
-        continue-on-error: true
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        with:
-          args: --severity-threshold=critical --sarif-file-output=snyk.sarif
+        run: snyk test --severity-threshold=critical --sarif-file-output=snyk.sarif
 
       # Upload to GitHub Security tab only if SARIF file was produced
       # (Snyk may not generate it if there's no manifest file or token issue)
