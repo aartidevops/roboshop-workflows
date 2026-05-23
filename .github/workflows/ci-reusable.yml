@@ -318,6 +318,7 @@ jobs:
           exit-code: '1'          # fail job on CRITICAL
           severity: CRITICAL
           scanners: vuln,secret
+          trivyignores: .trivyignore   # repo-level accepted CVEs with justification
 
       - name: Show full image report (HIGH + CRITICAL)
         if: always()
