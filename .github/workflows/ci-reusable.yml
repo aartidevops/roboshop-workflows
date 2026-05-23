@@ -318,7 +318,9 @@ jobs:
           exit-code: '1'          # fail job on CRITICAL
           severity: CRITICAL
           scanners: vuln,secret
-          trivyignores: .trivyignore   # repo-level accepted CVEs with justification
+          # trivyignores not set here — Trivy auto-detects .trivyignore in repo root.
+          # Each service repo can have its own .trivyignore for accepted CVEs.
+          # Shipping has one for CVE-2016-1000027. Other services have none (no accepted CVEs).
 
       - name: Show full image report (HIGH + CRITICAL)
         if: always()
